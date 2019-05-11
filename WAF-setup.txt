@@ -1,0 +1,245 @@
+#!/bin/bash
+
+# Create Resource Group.
+PREFIX="build"
+RG="${PREFIX}-waf-rg"
+LOC="westus2"
+AKSNAME="${PREFIX}waf"
+VNET_NAME="${PREFIX}vnet"
+AKSSUBNET_NAME="${PREFIX}akssubnet"
+SVCSUBNET_NAME="${PREFIX}svcsubnet"
+APPGWSUBNET_NAME="${PREFIX}appgwsubnet"
+IDENTITY_NAME="${PREFIX}identity"
+AGNAME="${PREFIX}ag"
+AGPUBLICIP_NAME="${PREFIX}agpublicip"
+STORAGE_NAME="${PREFIX}${DATE}storage"
+FILES_NAME="fruit"
+AZURE_ACCOUNT_NAME=<YOUR_SUBSCRIPTION>
+
+# Setup right subscription
+az account set -s $AZURE_ACCOUNT_NAME
+
+# Get ARM Access Token and Subscription ID
+ACCESS_TOKEN=$(az account get-access-token -o tsv --query 'accessToken')
+# Note: Update Subscription Name
+SUBID=$(az account show -s $AZURE_ACCOUNT_NAME -o tsv --query 'id')
+
+
+# Create Resource Group
+az group create --name $RG --location $LOC
+
+# Create Virtual Network & Subnets for AKS, k8s Services, ACI, Firewall and WAF
+az network vnet create \
+    --resource-group $RG \
+    --name $VNET_NAME \
+    --address-prefixes 10.42.0.0/16 \
+    --subnet-name $AKSSUBNET_NAME \
+    --subnet-prefix 10.42.1.0/24
+az network vnet subnet create \
+    --resource-group $RG \
+    --vnet-name $VNET_NAME \
+    --name $SVCSUBNET_NAME \
+    --address-prefix 10.42.2.0/24    
+az network vnet subnet create \
+    --resource-group $RG \
+    --vnet-name $VNET_NAME \
+    --name $APPGWSUBNET_NAME \
+    --address-prefix 10.42.3.0/24
+
+
+# Create SP and Assign Permission to Virtual Network
+# az ad sp create-for-rbac -n "${PREFIX}sp" --skip-assignment 
+
+# Automatically print the SP values into $APPID and $PASSWORD, trust me
+eval "$(az ad sp create-for-rbac -n ${PREFIX}sp --skip-assignment | jq -r '. | to_entries | .[] | .key + "=\"" + .value + "\""' | sed -r 's/^(.*=)/\U\1/')"
+echo $APPID
+echo $PASSWORD
+
+# Get $VNETID & $SUBNETID
+VNETID=$(az network vnet show -g $RG --name $VNET_NAME --query id -o tsv)
+SUBNETID=$(az network vnet subnet show -g $RG --vnet-name $VNET_NAME --name $AKSSUBNET_NAME --query id -o tsv)
+
+# Assign SP Permission to VNET
+az role assignment create --assignee $APPID --scope $VNETID --role Contributor
+
+az aks create -g $RG -n $AKSNAME -k 1.13.5 -l $LOC \
+  --node-count 2 --generate-ssh-keys \
+  --network-plugin azure \
+  --network-policy azure \
+  --service-cidr 10.41.0.0/16 \
+  --dns-service-ip 10.41.0.10 \
+  --docker-bridge-address 172.17.0.1/16 \
+  --vnet-subnet-id $SUBNETID \
+  --service-principal $APPID \
+  --client-secret $PASSWORD \
+  #--no-wait
+
+
+# Get AKS Credentials so kubectl works
+az aks get-credentials -g $RG -n $AKSNAME --admin
+
+
+# Get Nodes
+k get nodes -o wide
+
+# Create Azure App Gateway v2 with WAF and autoscale.
+# Note: Azure App Gateway v2 is currently in Preview.
+# Create Public IP First.
+az network public-ip create -g $RG -n $AGPUBLICIP_NAME -l $LOC --sku "Standard"
+# Create App Gateway using WAF_v2 SKU.
+az network application-gateway create \
+  --name $AGNAME \
+  --resource-group $RG \
+  --location $LOC \
+  --min-capacity 2 \
+  --frontend-port 80 \
+  --http-settings-cookie-based-affinity Disabled \
+  --http-settings-port 80 \
+  --http-settings-protocol Http \
+  --routing-rule-type Basic \
+  --sku WAF_v2 \
+  --private-ip-address 10.42.3.12 \
+  --public-ip-address $AGPUBLICIP_NAME \
+  --subnet $APPGWSUBNET_NAME \
+  --vnet-name $VNET_NAME
+
+
+# Deploy Azure AD Pod Identity
+k apply -f https://raw.githubusercontent.com/Azure/aad-pod-identity/master/deploy/infra/deployment-rbac.yaml
+
+
+# Create User Identity
+IDENTITY=$(az identity create -g "MC_${RG}_${AKSNAME}_${LOC}" -n $IDENTITY_NAME)
+echo $IDENTITY
+ASSIGNEEID=$(echo $IDENTITY | jq .clientId | tr -d '"')
+echo $ASSIGNEEID
+# Assign Reader Role
+ROLEREADER=$(az role assignment create --role Reader --assignee ${ASSIGNEEID} --scope "/subscriptions/${SUBID}/resourcegroups/MC_${RG}_${AKSNAME}_${LOC}")
+echo $ROLEREADER
+
+# Providing required permissions for MIC Using AKS SP
+SCOPEID=$(echo $IDENTITY | jq .id | tr -d '"')
+echo $SCOPEID
+ROLEMIC=$(az role assignment create --role "Managed Identity Operator" --assignee $APPID --scope $SCOPEID)
+echo $ROLEMIC
+
+# Install User Azure AD Identity and update ResourceID,  ClientID and name in aadpodidentity.yaml with output of $IDENTITY
+sed -i aadpodidentity.yaml -e "s/\(^.*ClientID: \).*/\1${ASSIGNEEID}/gI"
+sed -i aadpodidentity.yaml -e 's@\(^.*ResourceID: \).*@\1'"${SCOPEID}"'@gI'
+sed -i aadpodidentity.yaml -e "s/\(^.*name: \).*/\1${IDENTITY_NAME}/gI"
+
+k apply -f aadpodidentity.yaml
+
+
+# Install Pod to Identity Binding on k8s cluster and update name, AzureIdentity and Selector on aadpodidentitybinding.yaml with output of $IDENTITY
+sed -i aadpodidentitybinding.yaml -e "s/\(^.*name: \).*/\1${PREFIX}-identity-binding/gI"
+sed -i aadpodidentitybinding.yaml -e "s/\(^.*AzureIdentity: \).*/\1${IDENTITY_NAME}/gI"
+sed -i aadpodidentitybinding.yaml -e "s/\(^.*Selector: \).*/\1${PREFIX}aadbindingselector/gI"
+
+k apply -f aadpodidentitybinding.yaml
+
+# Check out Sample Deployment Using AAD Pod Identity to ensure everything is working.
+# Note: Update --subscriptionid --clientid and --resourcegroup in aadpodidentity-deployment.yaml accordingly.
+sed -i aadpodidentity-deployment.yaml -e "s/\(^.*aadpodidbinding: \).*/\1${PREFIX}aadbindingselector/gI"
+sed -i aadpodidentity-deployment.yaml -e "s/\(^.*subscriptionid=\).*/\1${SUBID}\"/gI"
+sed -i aadpodidentity-deployment.yaml -e "s/\(^.*clientid=\).*/\1${ASSIGNEEID}\"/gI"
+sed -i aadpodidentity-deployment.yaml -e "s/\(^.*resourcegroup=\).*/\1MC_${RG}_${AKSNAME}_${LOC}\"/gI"
+
+k apply -f aadpodidentity-deployment.yaml
+
+# Take note of the aadpodidentitybinding label as this determines which binding is used. 
+k get po --show-labels -o wide
+k logs $(kubectl get pod -l "app=demo" -o jsonpath='{.items[0].metadata.name}')
+# k exec $(kubectl get pod -l "app=demo" -o jsonpath='{.items[0].metadata.name}') -- /bin/bash -c env
+k delete -f aadpodidentity-deployment.yaml
+
+# Setup App Gateway Ingress
+# Get helm
+curl -LO https://git.io/get_helm.sh
+chmod 700 get_helm.sh
+./get_helm.sh
+
+# Setup Helm First
+kubectl create serviceaccount --namespace kube-system tiller-sa
+kubectl create clusterrolebinding tiller-cluster-rule --clusterrole=cluster-admin --serviceaccount=kube-system:tiller-sa
+helm init --tiller-namespace kube-system --service-account tiller-sa
+helm repo add application-gateway-kubernetes-ingress https://azure.github.io/application-gateway-kubernetes-ingress/helm/
+helm repo update
+
+# Install and Setup Ingress
+# Grant AAD Identity Access to App Gateway
+
+APPGATEWAYSCOPEID=$(az network application-gateway show -g $RG -n $AGNAME | jq .id | tr -d '"')
+echo $APPGATEWAYSCOPEID
+ROLEAGWCONTRIB=$(az role assignment create --role Contributor --assignee $ASSIGNEEID --scope $APPGATEWAYSCOPEID)
+ROLEAGWREADER=$(az role assignment create --role Reader --assignee $ASSIGNEEID --scope "/subscriptions/${SUBID}/resourcegroups/${RG}")
+ROLEAGWREADER2=$(az role assignment create --role Reader --assignee $ASSIGNEEID --scope $APPGATEWAYSCOPEID)
+echo $ROLEAGWCONTRIB
+echo $ROLEAGWREADER
+echo $ROLEAGWREADER2
+
+# Note: Update subscriptionId, resourceGroup, name, identityResourceID, identityClientID and apiServerAddress
+# in agw-helm-config.yaml file with the following.
+
+
+sed -i agw-helm-config.yaml -e "s/\(^.*subscriptionId: \).*/\1${SUBID}/gI"
+sed -i agw-helm-config.yaml -e "s/\(^.*resourceGroup: \).*/\1${RG}/gI"
+sed -i agw-helm-config.yaml -e "s/\(^.*name: \).*/\1${AGNAME}/gI"
+sed -i agw-helm-config.yaml -e 's@\(^.*identityResourceID: \).*@\1'"${SCOPEID}"'@gI'
+sed -i agw-helm-config.yaml -e "s/\(^.*identityClientID: \).*/\1${ASSIGNEEID}/gI"
+
+APISERVER=$(az aks show -n $AKSNAME -g $RG --query 'fqdn' -o tsv)
+sed -i agw-helm-config.yaml -e "s/\(^.*apiServerAddress: \).*/\1${APISERVER}/gI"
+
+helm install --name $AGNAME -f agw-helm-config.yaml application-gateway-kubernetes-ingress/ingress-azure
+
+# Check created resources
+k get po,svc,ingress,deploy,secrets
+helm list
+
+## Deploy Workload
+# Add Web Front-End
+
+sed -i build19-web.yaml -e "s/\(^.*azure-load-balancer-internal-subnet: \).*/\1\"${SVCSUBNET_NAME}\"/gI"
+k apply -f build19-web.yaml
+k apply -f build19-ingress-web.yaml
+
+# Add Worker Back-End
+az storage account create -n $STORAGE_NAME -g $RG -l $LOC
+STORAGE_KEY=$(az storage account keys list -n $STORAGE_NAME -g $RG --query [0].'value' -o tsv)
+
+az storage share create -n $FILES_NAME --account-key $STORAGE_KEY --account-name $STORAGE_NAME
+az storage file upload-batch --destination $FILES_NAME --source ./fruit/ --account-name $STORAGE_NAME --account-key $STORAGE_KEY
+
+k create secret generic fruit-secret --from-literal=azurestorageaccountname=$STORAGE_NAME --from-literal=azurestorageaccountkey=$STORAGE_KEY
+
+k apply -f build19-worker.yaml
+
+k get po,svc,ingress,deploy,secrets
+
+#Check workload
+az network public-ip show -g $RG -n $AGPUBLICIP_NAME --query "ipAddress" -o tsv
+
+# Browser or curl
+
+
+## Clean up
+
+k delete -f build19-worker.yaml
+k delete secret fruit-secret
+k delete -f build19-ingress-web.yaml
+k delete -f build19-web.yaml
+
+helm del --purge $AGNAME
+helm reset
+kubectl delete clusterrolebinding tiller-cluster-rule
+kubectl delete -n kube-system serviceaccount tiller-sa
+
+ROLEAGWCONTRIBID=$(echo ${ROLEAGWCONTRIB} | jq .id | tr -d '"')
+ROLEAGWREADERID=$(echo ${ROLEAGWREADER} | jq .id | tr -d '"')
+ROLEAGWREADER2ID=$(echo ${ROLEAGWREADER2} | jq .id | tr -d '"')
+
+az role assignment delete --ids $ROLEAGWCONTRIBID $ROLEAGWREADERID $ROLEAGWREADER2ID
+
+# az group delete -n $RG -y
+# az ad sp delete --id $APPID

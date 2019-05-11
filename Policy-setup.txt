@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# Create Resource Group.
+PREFIX="build-policy"
+RG="${PREFIX}-rg"
+LOC="westus2"
+AKSNAME="${PREFIX}"
+K8S_VERSION=1.13.5
+AZURE_ACCOUNT_NAME=<YOUR_SUBSCRIPTION>
+SUBID=$(az account show -s $AZURE_ACCOUNT_NAME -o tsv --query 'id')
+
+# Setup right subscription
+az account set -s $AZURE_ACCOUNT_NAME
+
+# Automatically print the SP values into $APPID and $PASSWORD, trust me
+eval "$(az ad sp create-for-rbac -n ${PREFIX}sp --skip-assignment | jq -r '. | to_entries | .[] | .key + "=\"" + .value + "\""' | sed -r 's/^(.*=)/\U\1/')"
+echo $APPID
+echo $PASSWORD
+
+# Create Resource Group
+az group create --name $RG --location $LOC
+
+az aks create -g $RG -n $AKSNAME -k $K8S_VERSION -l $LOC \
+  --node-count 2 --generate-ssh-keys \
+  --network-plugin azure \
+  --service-principal $APPID \
+  --client-secret $PASSWORD
+
+  # Get AKS Credentials so kubectl works
+az aks get-credentials -g $RG -n $AKSNAME --admin
+
+k apply -f test-pod.yaml
+
+az aks enable-addons --addons azure-policy --name $AKSNAME --resource-group $RG
+
+
+
+## Clean up
+
+az aks disable-addons --addons azure-policy -n $AKSNAME -g $RG
+
+# az ad sp delete --id $APPID
+# az group delete -n $RG -y --no-wait
